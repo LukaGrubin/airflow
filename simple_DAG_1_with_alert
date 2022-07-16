@@ -1,0 +1,119 @@
+from datetime import timedelta, datetime
+from airflow import DAG
+import sqlite3
+import pandas as pd
+from airflow.utils.dates import days_ago
+from airflow.operators.python_operator import PythonOperator
+from airflow.providers.telegram.operators.telegram import TelegramOperator
+from airflow.exceptions import AirflowException
+
+
+CON = sqlite3.connect('test.db')
+#задача для скачивания данных о валюте
+def read_currency(url, **context):
+  data = pd.read_csv(url)
+  data["insert_time"] = pd.to_datetime('now')
+  context['ti'].xcom_push(key='rate', value=data['rate'][0])
+  
+#задача для скачивания датафрейма с репозитория 
+def read_data(url, table_name, tmp_file, conn=CON, **context):
+  pd.read_csv(url).to_csv(tmp_file)
+  data = pd.read_csv(tmp_file)
+  data.to_sql(table_name, conn, if_exists='replace', index=False)
+#задача для объединения данных
+def join_data(sql, conn=CON, **context):
+
+  cursor = conn.cursor()
+  cursor.executescript(sql)
+  record = cursor.fetchall()
+  cursor.close()
+#задача для отправки алерта в телеграм 
+def send_alert(context):
+
+    send_message = TelegramOperator(
+        task_id='send_message_telegram',
+        telegram_conn_id='telegram_id',   #тут информация находится в connections в веб-интерфейсе
+        chat_id='',  #тут чат-айди для телеграма 
+
+        #внутри f-строки табуляция тоже учитвыется как символ, поэтому чтобы в сообщении не было отсупов пришлось их немного сместить тут
+        text=f'''Task failded!
+Dag name: {context.get("ti").dag_id}                 
+Task name: {context.get("ti").task_id}
+Task start date: {context.get("ds")}
+         ''',
+        dag=dag)
+
+    return send_message.execute(context=context)
+
+
+def raise_exception(context):
+    raise AirflowException()
+
+
+
+dag = DAG(dag_id='dag',
+      default_args={'owner': 'airflow',
+                    'on_failure_callback':send_alert},
+      schedule_interval="@daily",
+      start_date=datetime.fromisoformat('2021-01-01'),
+      end_date=datetime.fromisoformat('2021-01-04'))
+
+drop_logs= BashOperator(
+    task_id='drop_logs',
+    bash_command='rm "/root/airflow/logs"',
+    dag=dag
+)
+
+raise_exception = PythonOperator(
+    task_id='raise_exception',
+    python_callable=raise_exception
+)
+
+read_currency = PythonOperator(
+        task_id='read_currency',
+        python_callable=read_currency,
+        op_kwargs={'url':'https://api.exchangerate.host/timeseries?start_date={{execution_date}}1&end_date={{execution_date}}?base=EUR&symbols=USD&format=csv'
+        },
+        do_xcom_push=True,
+        dag=dag
+        
+)
+
+read_data = PythonOperator(
+        task_id='read_data',
+        python_callable=read_data,
+        op_kwargs={'url':'https://raw.githubusercontent.com/dm-novikov/stepik_airflow_course/main/data_new/{{ds}}.csv',
+                   'tmp_file':'/tmp/file_d.csv',
+                   'table_name': 'data'
+                   },
+        dag=dag    
+)
+
+
+join_data = PythonOperator(
+      task_id='join_data',
+      python_callable=join_data,
+      op_kwargs={
+
+                'sql':'''
+                CREATE TABLE IF NOT EXISTS join_data(
+                date DATE,
+                rate REAL,
+                base VARCHAR(10),
+                value INT
+                );
+                insert into join_data(date,  base, value)
+                SELECT date,  currency, value
+                FROM data ;
+                update join_data 
+                set rate = ( 
+                select  \"{{task_instance.xcom_pull(task_ids='read_currency', key='rate')}}\"
+                )                
+                ;
+                '''},
+                dag=dag  
+                )
+
+
+
+read_currency >> read_data >> join_data
