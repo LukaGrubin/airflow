@@ -66,9 +66,9 @@ insert_sqlite_currency = PythonOperator(
     dag=dag,
 )
 
-# Ваше задание
 
-# Создать таблицу через SQLiteOperator
+
+# Создаем таблицу через SQLiteOperator
 create_table_join = SqliteOperator(
     task_id='create_table_join',
     sql="""    CREATE TABLE IF NOT EXISTS join_data(
